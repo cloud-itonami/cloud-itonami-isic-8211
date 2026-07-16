@@ -1,0 +1,97 @@
+(ns officeadminops.sim
+  "Demo driver -- `clojure -M:run`. Walks a clean task-record logging
+  request through intake -> advise -> govern -> decide -> approval ->
+  commit at phase 1 (assisted-logging, always approval), then re-runs the
+  same op at phase 3 (supervised-auto, clean + high confidence ->
+  auto-commit), then a service-operation scheduling request and a
+  low-cost supply-order coordination naming a verified vendor (both
+  auto-commit clean at phase 3), then a high-cost supply-order (ALWAYS
+  escalates regardless of phase), then a confidentiality-concern flag
+  (ALWAYS escalates, at any phase -- approve, then commit), then
+  HARD-hold scenarios: an unregistered client, a client registered but
+  not yet verified, a supply-order naming an unverified vendor, a
+  proposal whose own `:effect` is not `:propose`, and a proposal that has
+  drifted into the permanently-excluded client-confidential-disclosure/
+  decide-on-behalf-of-client scope."
+  (:require [langgraph.graph :as g]
+            [officeadminops.advisor :as advisor]
+            [officeadminops.store :as store]
+            [officeadminops.operation :as op]))
+
+(defn- exec-op [actor tid request context]
+  (g/run* actor {:request request :context context} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "office-admin-coordinator-1"}} {:thread-id tid :resume? true}))
+
+(defn -main [& _]
+  (let [db (store/seed-db)
+        coordinator-phase-1 {:actor-id "coord-1" :actor-role :office-admin-coordinator :phase 1}
+        coordinator-phase-3 {:actor-id "coord-1" :actor-role :office-admin-coordinator :phase 3}
+        actor (op/build db)]
+
+    (println "== log-task-record client-1 (phase 1, escalates -- human approves) ==")
+    (let [r (exec-op actor "t1" {:op :log-task-record :client-id "client-1"
+                                  :patch {:task "mail-processed" :count 12}} coordinator-phase-1)]
+      (println r)
+      (println "-- human office-admin coordinator approves --")
+      (println (approve! actor "t1")))
+
+    (println "\n== log-task-record client-1 (phase 3, clean -- auto-commits) ==")
+    (println (exec-op actor "t2" {:op :log-task-record :client-id "client-1"
+                                  :patch {:task "billing-processed" :count 5}} coordinator-phase-3))
+
+    (println "\n== schedule-service-operation client-1 (phase 3, clean -- auto-commits) ==")
+    (println (exec-op actor "t3" {:op :schedule-service-operation :client-id "client-1"
+                                  :patch {:shift "front-desk" :date "2026-07-20" :window "09:00-17:00"}} coordinator-phase-3))
+
+    (println "\n== coordinate-supply-order client-1, low cost, verified vendor (phase 3, clean -- auto-commits) ==")
+    (println (exec-op actor "t4" {:op :coordinate-supply-order :client-id "client-1"
+                                  :patch {:item "office-supplies restock" :quantity 50 :estimated-cost 260.0
+                                          :vendor-id "vendor-1"}} coordinator-phase-3))
+
+    (println "\n== coordinate-supply-order client-1, HIGH cost (ALWAYS escalates, even at phase 3) ==")
+    (let [r (exec-op actor "t5" {:op :coordinate-supply-order :client-id "client-1"
+                                 :patch {:item "office copier/printer" :quantity 1 :estimated-cost 3200.0
+                                         :vendor-id "vendor-1"}} coordinator-phase-3)]
+      (println r)
+      (println "-- human office-admin coordinator reviews & approves --")
+      (println (approve! actor "t5")))
+
+    (println "\n== flag-confidentiality-concern client-1 (ALWAYS escalates, even at phase 3) ==")
+    (let [r (exec-op actor "t6" {:op :flag-confidentiality-concern :client-id "client-1"
+                                 :patch {:concern "misrouted invoice containing client billing detail sent to the wrong recipient mailbox" :confidence 0.92}} coordinator-phase-3)]
+      (println r)
+      (println "-- human office-admin coordinator reviews & approves --")
+      (println (approve! actor "t6")))
+
+    (println "\n== log-task-record client-99 (unregistered client -> HARD hold) ==")
+    (println (exec-op actor "t7" {:op :log-task-record :client-id "client-99"
+                                  :patch {:task "none"}} coordinator-phase-3))
+
+    (println "\n== log-task-record client-3 (registered but unverified -> HARD hold) ==")
+    (println (exec-op actor "t8" {:op :log-task-record :client-id "client-3"
+                                  :patch {:task "mail-processed"}} coordinator-phase-3))
+
+    (println "\n== coordinate-supply-order client-1, vendor-2 unverified (-> HARD hold) ==")
+    (println (exec-op actor "t9" {:op :coordinate-supply-order :client-id "client-1"
+                                  :patch {:item "imported office equipment" :quantity 2 :estimated-cost 300.0
+                                          :vendor-id "vendor-2"}} coordinator-phase-3))
+
+    (println "\n== schedule-service-operation client-1, advisor attempts direct actuation (:effect :commit) -> HARD hold ==")
+    (let [actor-direct (op/build db {:advisor (reify advisor/Advisor
+                                                (-advise [_ _ req]
+                                                  (assoc (advisor/infer nil req) :effect :commit)))})]
+      (println (exec-op actor-direct "t10" {:op :schedule-service-operation :client-id "client-1"
+                                           :patch {:shift "reception" :date "2026-07-22"}} coordinator-phase-3)))
+
+    (println "\n== log-task-record client-1, advisor drifts into client-confidential-disclosure/decide-on-behalf-of-client scope -> HARD hold, permanent ==")
+    (println (exec-op actor "t11" {:op :log-task-record :client-id "client-1"
+                                   :out-of-scope? true
+                                   :patch {}} coordinator-phase-3))
+
+    (println "\n== audit ledger ==")
+    (doseq [f (store/ledger db)] (println f))
+
+    (println "\n== committed coordination log ==")
+    (doseq [r (store/coordination-log db)] (println r))))
