@@ -1,0 +1,618 @@
+(ns officeadminops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300):
+  this repo previously had NO demo page and no generator at all. This
+  namespace drives the REAL actor stack (`officeadminops.operation` ->
+  `officeadminops.governor` -> `officeadminops.phase` ->
+  `officeadminops.store`, through `langgraph.graph/run*`) and renders
+  whatever that run actually produced.
+
+  NOTHING on this page is typed by hand:
+
+    - the client-contract rows come from `store/all-client-records`
+    - the vendor rows come from `store/all-vendor-records`
+    - the rollout-phase matrix is produced by CALLING `phase/gate` for
+      every (phase, op) pair, not transcribed from `phase/phases`
+    - the HARD-check rows are grouped out of the real `:governor-hold`
+      facts the run wrote to the ledger
+    - the request-outcome rows are classified from each run's OWN audit
+      trail (`:audit` on the returned graph state)
+    - the committed-coordination rows come from `store/coordination-log`
+    - the approver-attribution disclosure is DERIVED at render time by
+      walking the real store (see `approver-attribution`), so it cannot
+      drift away from the code the day `store/commit-record!` changes
+
+  Scenario shape (adapted from this repo's own `officeadminops.sim` demo
+  driver, `clojure -M:dev:run`, which was run BEFORE this file was
+  written and confirmed to produce a sensible ledger against the real
+  seeded ids `client-1`..`client-3` / `vendor-1`..`vendor-2`):
+
+    - client-1 walks the full clean lifecycle: a task-record log at
+      phase 1 (escalates `:phase-approval`, approved), the same op at
+      phase 3 (auto-commits), a staffing schedule and a low-cost supply
+      order (both auto-commit clean at phase 3), a HIGH-cost supply
+      order (ALWAYS escalates -- the governor's own `high-stakes?` --
+      approved), and a confidentiality-concern flag (ALWAYS escalates at
+      every phase, approved).
+    - client-2 shows the two SOFT outcomes a HARD hold can never reach:
+      a low-confidence proposal (escalates `:low-confidence`, approved)
+      and a confidentiality flag the human REJECTS.
+    - five HARD governor holds fire over four DISTINCT rules; none of
+      them reaches a human, which `-main` verifies structurally.
+    - one PHASE hold (phase 0, writes disabled) shows the phase gate
+      adding caution on top of a governor-clean proposal -- deliberately
+      counted separately from the HARD governor holds.
+
+  Build-time invariants -- `-main` THROWS, it does not warn:
+    1. the run must produce at least one real `:governor-hold` fact
+       carrying actual violations (the HARD-hold requirement is an
+       invariant, not a convention);
+    2. it must exercise at least `min-distinct-hard-rules` DISTINCT HARD
+       rules -- an evidence floor, so a governor change that silently
+       stops firing a check fails the build instead of quietly shrinking
+       the page;
+    3. no run that HARD-held may also have asked a human (no
+       `:approval-requested` in that same run's audit) -- the
+       'HARD holds never reach a human' claim is MEASURED, not asserted;
+    4. every HARD-check row rendered must trace to a rule actually
+       present in the ledger -- the section cannot outlive the run that
+       justified it.
+
+  Deterministic: no timestamps, no random ids, no map-iteration order
+  escapes into the output (every key set is sorted before printing).
+  Byte-identical across reruns against the same seed.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [officeadminops.advisor :as advisor]
+            [officeadminops.store :as store]
+            [officeadminops.phase :as phase]
+            [officeadminops.governor :as governor]
+            [officeadminops.operation :as op]
+            [langgraph.graph :as g]))
+
+(def ^:private min-distinct-hard-rules
+  "Evidence floor. The scenario below is built to fire four distinct HARD
+  governor rules (`:client-contract-unverified`, `:vendor-unverified`,
+  `:effect-not-propose`, `:scope-excluded`) -- i.e. every HARD check
+  `officeadminops.governor` implements. If a governor change stops one
+  from firing, the build fails loudly instead of rendering a quietly
+  smaller page."
+  4)
+
+(def ^:private coordinator
+  {:actor-id "coord-1" :actor-role :office-admin-coordinator})
+
+(defn- ctx [phase] (assoc coordinator :phase phase))
+
+;; ----------------------------- the real run -----------------------------
+
+(defn- exec!
+  "One real actor run. Returns {:label .. :phase .. :request .. :state ..}
+  where `:state` is whatever `langgraph.graph/run*` actually produced."
+  [actor label phase tid request]
+  {:label label :phase phase :request request
+   :state (:state (g/run* actor {:request request :context (ctx phase)}
+                          {:thread-id tid}))})
+
+(defn- resume!
+  "Resume a paused run with a real human decision, and fold the resumed
+  audit onto the paused run so one row shows the whole handoff."
+  [actor run tid status by]
+  (let [s (:state (g/run* actor {:approval {:status status :by by}}
+                          {:thread-id tid :resume? true}))]
+    (assoc run :state s :approver (when (= :approved status) by))))
+
+(defn- low-confidence-advisor
+  "The mock advisor with its confidence pushed under
+  `governor/confidence-floor`. The Advisor protocol is a documented
+  injection seam on `operation/build` (the same seam `sim` uses to
+  exercise the direct-actuation block), so this is still the REAL
+  pipeline -- only the contained intelligence node is swapped."
+  [conf]
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :confidence conf))))
+
+(defn- direct-actuation-advisor
+  "The mock advisor claiming `:effect :commit` -- a proposal asserting it
+  may actuate outside governance. Exercises the `:effect-not-propose`
+  HARD check end to end."
+  []
+  (reify advisor/Advisor
+    (-advise [_ _ req] (assoc (advisor/infer nil req) :effect :commit))))
+
+(defn run-demo!
+  "Runs a fresh seeded store through the scenario described in the ns
+  docstring. Returns {:db .. :runs [..]} -- every field the renderer
+  reads below is real graph/governor/store output."
+  []
+  (let [db (store/seed-db)
+        actor (op/build db)
+        actor-low (op/build db {:advisor (low-confidence-advisor 0.35)})
+        actor-direct (op/build db {:advisor (direct-actuation-advisor)})
+        runs
+        [;; --- client-1: the full clean lifecycle ---
+         (as-> (exec! actor "task record, phase 1 (writes enabled, no auto)" 1 "t1"
+                      {:op :log-task-record :client-id "client-1"
+                       :patch {:task "mail-processed" :count 12}}) r
+           (resume! actor r "t1" :approved "office-admin-coordinator-1"))
+
+         (exec! actor "task record, phase 3 (governor-clean, auto)" 3 "t2"
+                {:op :log-task-record :client-id "client-1"
+                 :patch {:task "billing-processed" :count 5}})
+
+         (exec! actor "staffing schedule, phase 3 (governor-clean, auto)" 3 "t3"
+                {:op :schedule-service-operation :client-id "client-1"
+                 :patch {:shift "front-desk" :date "2026-07-20" :window "09:00-17:00"}})
+
+         (exec! actor "supply order below threshold, verified vendor" 3 "t4"
+                {:op :coordinate-supply-order :client-id "client-1"
+                 :patch {:item "office-supplies restock" :quantity 50
+                         :estimated-cost 260.0 :vendor-id "vendor-1"}})
+
+         (as-> (exec! actor "supply order ABOVE threshold (always escalates)" 3 "t5"
+                      {:op :coordinate-supply-order :client-id "client-1"
+                       :patch {:item "office copier/printer" :quantity 1
+                               :estimated-cost 3200.0 :vendor-id "vendor-1"}}) r
+           (resume! actor r "t5" :approved "office-admin-coordinator-1"))
+
+         (as-> (exec! actor "confidentiality concern (always escalates)" 3 "t6"
+                      {:op :flag-confidentiality-concern :client-id "client-1"
+                       :patch {:concern "misrouted invoice containing client billing detail sent to the wrong recipient mailbox"
+                               :confidence 0.92}}) r
+           (resume! actor r "t6" :approved "office-admin-coordinator-1"))
+
+         ;; --- client-2: the two SOFT outcomes a HARD hold never reaches ---
+         (as-> (exec! actor-low "task record, advisor below the confidence floor" 3 "t7"
+                      {:op :log-task-record :client-id "client-2"
+                       :patch {:task "records-archived" :count 3}}) r
+           (resume! actor-low r "t7" :approved "office-admin-coordinator-2"))
+
+         (as-> (exec! actor "confidentiality concern the human REJECTS" 3 "t8"
+                      {:op :flag-confidentiality-concern :client-id "client-2"
+                       :patch {:concern "retention obligation on a closed matter file is ambiguous"
+                               :confidence 0.71}}) r
+           (resume! actor r "t8" :rejected "office-admin-coordinator-2"))
+
+         ;; --- HARD holds: none of these ever reaches a human ---
+         (exec! actor "task record for an UNREGISTERED client" 3 "t9"
+                {:op :log-task-record :client-id "client-99" :patch {:task "none"}})
+
+         (exec! actor "task record for a registered but UNVERIFIED client" 3 "t10"
+                {:op :log-task-record :client-id "client-3" :patch {:task "mail-processed"}})
+
+         (exec! actor "supply order naming an UNVERIFIED vendor" 3 "t11"
+                {:op :coordinate-supply-order :client-id "client-1"
+                 :patch {:item "imported office equipment" :quantity 2
+                         :estimated-cost 300.0 :vendor-id "vendor-2"}})
+
+         (exec! actor-direct "advisor claims direct actuation (:effect :commit)" 3 "t12"
+                {:op :schedule-service-operation :client-id "client-1"
+                 :patch {:shift "reception" :date "2026-07-22"}})
+
+         (exec! actor "advisor drifts into permanently-excluded scope" 3 "t13"
+                {:op :log-task-record :client-id "client-1" :out-of-scope? true :patch {}})
+
+         ;; --- phase hold: governor-clean, but writes are off at phase 0 ---
+         (exec! actor "task record at phase 0 (read-only rollout stage)" 0 "t14"
+                {:op :log-task-record :client-id "client-1"
+                 :patch {:task "filing-processed" :count 2}})]]
+    {:db db :runs runs}))
+
+;; ----------------------------- derivation -----------------------------
+
+(defn- fact-of [audit t] (first (filter #(= t (:t %)) audit)))
+
+(defn- hard-hold-fact
+  "A `:governor-hold` fact carrying REAL governor violations. A phase
+  hold also writes `:governor-hold` but with an empty `:violations`, so
+  the two are distinguished structurally, never by label."
+  [audit]
+  (let [h (fact-of audit :governor-hold)]
+    (when (seq (:violations h)) h)))
+
+(defn- phase-hold-fact
+  [audit]
+  (let [h (fact-of audit :governor-hold)]
+    (when (and h (empty? (:violations h))) h)))
+
+(defn- outcome
+  "Classify one real run from its OWN audit trail. Never from a literal."
+  [{:keys [state]}]
+  (let [audit (:audit state)]
+    (cond
+      (hard-hold-fact audit)
+      {:kind :hard-hold :fact (hard-hold-fact audit)}
+
+      (fact-of audit :approval-rejected)
+      {:kind :rejected :fact (fact-of audit :approval-rejected)}
+
+      (phase-hold-fact audit)
+      {:kind :phase-hold :fact (phase-hold-fact audit)}
+
+      (fact-of audit :approval-granted)
+      {:kind :approved
+       :fact (fact-of audit :approval-granted)
+       :asked (fact-of audit :approval-requested)}
+
+      (fact-of audit :approval-requested)
+      {:kind :awaiting :fact (fact-of audit :approval-requested)}
+
+      (fact-of audit :committed)
+      {:kind :auto-commit :fact (fact-of audit :committed)}
+
+      :else {:kind :unknown})))
+
+(defn- ledger-holds
+  "The `:governor-hold` facts that actually reached the store ledger."
+  [db]
+  (filterv #(= :governor-hold (:t %)) (store/ledger db)))
+
+(defn- hard-rules
+  "Distinct HARD rule keywords the run actually produced, sorted."
+  [db]
+  (->> (ledger-holds db) (mapcat :basis) (remove nil?) distinct sort vec))
+
+(defn- deep-key-names
+  "Every map key anywhere inside `x`, as strings."
+  [x]
+  (cond
+    (map? x) (into (into #{} (map #(if (keyword? %) (name %) (str %))) (keys x))
+                   (mapcat deep-key-names (vals x)))
+    (sequential? x) (into #{} (mapcat deep-key-names x))
+    :else #{}))
+
+(defn- approver-attribution
+  "DERIVED, at render time, from the REAL store -- never hardcoded.
+
+  `operation`'s `:request-approval` node attaches the human approver at
+  `[:payload :approved-by]` on the committed record. Whether that
+  survives depends entirely on what THIS repo's `store/commit-record!`
+  does with the record it is handed, and whether the `:commit` node ever
+  appends an `:approval-granted` fact to the ledger. Both are re-checked
+  here by walking the actual post-run store, so this disclosure tracks
+  the code instead of asserting a claim that goes stale the day the
+  store changes.
+
+  Returns {:approvers .. :on-record? .. :on-ledger? .. :approved-runs ..
+  :records-with-approver ..}."
+  [db runs]
+  (let [records (store/coordination-log db)
+        approver-key? #(contains? #{"approved-by" "approved_by" "approver" "approved-by-id"}
+                                  (str/lower-case %))
+        with-approver (filterv #(some approver-key? (deep-key-names %)) records)
+        approved-runs (filterv #(= :approved (:kind (outcome %))) runs)]
+    {:approvers (vec (sort (into #{} (keep #(:by (fact-of (:audit (:state %)) :approval-granted)))
+                                 runs)))
+     :approved-runs (count approved-runs)
+     :records-with-approver (count with-approver)
+     :on-record? (boolean (seq with-approver))
+     :on-ledger? (boolean (some #(= :approval-granted (:t %)) (store/ledger db)))}))
+
+;; ----------------------------- build-time invariants -----------------------------
+
+(defn assert-real-holds!
+  "Build-time invariants 1-3. THROWS -- a console that claims a governed
+  actor while its scenario produced no HARD hold is worse than no
+  console at all, so this is an invariant rather than a convention
+  (precedent: cloud-itonami-isic-2513)."
+  [{:keys [db runs]}]
+  (let [holds (filterv #(seq (:violations %)) (ledger-holds db))
+        rules (hard-rules db)
+        leaked (filterv (fn [r]
+                          (let [a (:audit (:state r))]
+                            (and (hard-hold-fact a) (fact-of a :approval-requested))))
+                        runs)]
+    (when (zero? (count holds))
+      (throw (ex-info "operator-console build FAILED: the run produced 0 :governor-hold records. A HARD governor hold is a build-time invariant of this page, not a convention -- the console must not claim a governed actor it did not exercise."
+                      {:governor-holds 0 :ledger-facts (count (store/ledger db))})))
+    (when (< (count rules) min-distinct-hard-rules)
+      (throw (ex-info (str "operator-console build FAILED: only " (count rules)
+                           " distinct HARD governor rule(s) fired; the evidence floor is "
+                           min-distinct-hard-rules
+                           ". A governor check has stopped firing, or the scenario stopped exercising it.")
+                      {:rules rules :required min-distinct-hard-rules})))
+    (when (seq leaked)
+      (throw (ex-info "operator-console build FAILED: a HARD-held run also asked a human for approval. HARD holds must never reach a human."
+                      {:runs (mapv :label leaked)})))
+    {:holds (count holds) :rules rules}))
+
+;; ----------------------------- html helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- code [v] (str "<code>" (esc v) "</code>"))
+
+(defn- kwname [v] (if (keyword? v) (name v) (str v)))
+
+(defn- sorted-kv
+  "A small map printed in sorted-key order, so no map-iteration order
+  can leak into the rendered bytes."
+  [m]
+  (->> (sort-by (comp str key) m)
+       (map (fn [[k v]] (str (kwname k) "=" (if (string? v) v (pr-str v)))))
+       (str/join ", ")))
+
+(defn- tag [cls text] (str "<span class=\"" cls "\">" text "</span>"))
+
+(defn- row [& cells]
+  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- table [headers rows]
+  (str "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" (esc %) "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n" (str/join "\n" rows) "\n"
+       "      </tbody>\n"
+       "    </table>\n"))
+
+(defn- section [title lede body]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" title "</h2>\n"
+       "    <p class=\"muted\">" lede "</p>\n"
+       body
+       "  </section>\n"))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- client-rows [db]
+  (for [{:keys [client-id name registered? verified?]} (store/all-client-records db)]
+    (row (code client-id) (esc name)
+         (if registered? (tag "ok" "registered") (tag "critical" "not registered"))
+         (if verified? (tag "ok" "verified") (tag "critical" "not verified"))
+         (if (and registered? verified?)
+           (tag "ok" "proposals may proceed")
+           (tag "critical" "every proposal HARD-held")))))
+
+(defn- vendor-rows [db]
+  (for [{:keys [vendor-id name registered? verified?]} (store/all-vendor-records db)]
+    (row (code vendor-id) (esc name)
+         (if registered? (tag "ok" "registered") (tag "critical" "not registered"))
+         (if verified? (tag "ok" "verified") (tag "critical" "not verified"))
+         (if (and registered? verified?)
+           (tag "ok" "supply orders may proceed")
+           (tag "critical" "supply orders HARD-held")))))
+
+(defn- gate-cell
+  "CALLS `phase/gate` -- the matrix is computed, not transcribed."
+  [ph op]
+  (let [{:keys [disposition reason]} (phase/gate ph {:op op} :commit)]
+    (case disposition
+      :commit (tag "ok" "auto-commit")
+      :escalate (tag "warn" (str "human approval &middot; " (esc (kwname reason))))
+      :hold (tag "critical" (str "blocked &middot; " (esc (kwname reason)))))))
+
+(defn- phase-rows
+  "One row per op, one column per phase, every cell from a real
+  `phase/gate` call against a governor-CLEAN (`:commit`) base."
+  [ops phases]
+  (for [op ops]
+    (apply row (code op) (for [ph phases] (gate-cell ph op)))))
+
+(defn- hard-check-rows
+  "Grouped out of the REAL `:governor-hold` facts. Invariant 4: a row can
+  only exist because the ledger carries that rule."
+  [db]
+  (let [by-rule (group-by :rule (mapcat :violations (ledger-holds db)))]
+    (for [[rule vs] (sort-by (comp str key) by-rule)]
+      (row (code rule)
+           (tag "critical" (str (count vs) " hold" (when (> (count vs) 1) "s")))
+           (esc (:detail (first vs)))))))
+
+(defn- outcome-cell [{:keys [kind fact]}]
+  (case kind
+    :hard-hold (tag "critical" (str "HARD hold &middot; "
+                                    (esc (str/join ", " (map kwname (:basis fact))))))
+    :phase-hold (tag "critical" (str "phase hold &middot; "
+                                     (esc (kwname (:phase-reason fact)))))
+    :rejected (tag "critical" "human REJECTED &middot; not committed")
+    :approved (tag "ok" "human approved &middot; committed")
+    :auto-commit (tag "ok" "auto-committed")
+    :awaiting (tag "warn" "awaiting human approval")
+    (tag "muted" "no disposition")))
+
+(defn- gate-reason-cell [{:keys [kind fact asked]}]
+  (case kind
+    :approved (esc (kwname (:reason asked)))
+    :awaiting (esc (kwname (:reason fact)))
+    :rejected "approver-rejected"
+    :auto-commit "&mdash;"
+    :hard-hold (tag "muted" "never reached a human")
+    :phase-hold (tag "muted" "never reached a human")
+    "&mdash;"))
+
+(defn- request-rows [runs]
+  (for [{:keys [label phase request state] :as r} runs
+        :let [o (outcome r)]]
+    (row (esc label)
+         (code (:op request))
+         (code (or (:client-id request) "&mdash;"))
+         (str phase)
+         (outcome-cell o)
+         (gate-reason-cell o)
+         (esc (or (:confidence (fact-of (:audit state) :advisor-proposal)) "")))))
+
+(defn- coordination-rows [db]
+  (for [{:keys [op client-id value payload]} (store/coordination-log db)]
+    (row (code op) (code client-id)
+         (esc (sorted-kv (dissoc value :client-id)))
+         (if-let [by (:approved-by payload)]
+           (tag "ok" (esc by))
+           (tag "muted" "auto-committed &middot; no approver")))))
+
+(defn- ledger-rows [db]
+  (for [{:keys [t op client-id basis confidence summary]} (store/ledger db)]
+    (row (esc (kwname t)) (code op) (code client-id)
+         (if (seq basis)
+           (esc (str/join ", " (map kwname basis)))
+           (tag "muted" "&mdash;"))
+         (esc (or confidence ""))
+         (esc (or summary "")))))
+
+(defn- attribution-section
+  "Renders the approver disclosure from the DERIVED facts, so the claim
+  tracks the code. The page never prints an approver as though the store
+  held one when it does not."
+  [{:keys [approvers approved-runs records-with-approver on-record? on-ledger?]}]
+  (section
+   "Approver attribution (derived, not asserted)"
+   (str "Re-derived at render time by walking the actual post-run store &mdash; every "
+        "record in <code>store/coordination-log</code> is scanned for an approver key, and "
+        "the ledger for an <code>:approval-granted</code> fact. This section reports what "
+        "the store <em>measurably does</em>, so it cannot drift away from the code.")
+   (str
+    (table
+     ["What was checked" "Result"]
+     [(row "runs a human actually approved this scenario"
+           (str approved-runs))
+      (row (str "approver id(s) on those runs&rsquo; " (code ":approval-granted") " audit fact")
+           (if (seq approvers)
+             (str/join " " (map code approvers))
+             (tag "muted" "none")))
+      (row (str "committed records in " (code "store/coordination-log") " carrying an approver key")
+           (str records-with-approver " of " approved-runs " approved &middot; "
+                (if on-record?
+                  (tag "ok" "approver retained on the record")
+                  (tag "critical" "approver dropped by the store"))))
+      (row (str "an " (code ":approval-granted") " fact reached the store ledger")
+           (if on-ledger?
+             (tag "ok" "yes")
+             (tag "warn" "no &mdash; audit only, not retained in the ledger")))])
+    "    <p class=\"muted\">"
+    (cond
+      (empty? approvers)
+      "This run produced no human approval, so there is no approver to attribute."
+
+      (and on-record? on-ledger?)
+      "The approver is persisted on the committed record <em>and</em> as a ledger fact."
+
+      on-record?
+      (str "The approver <strong>is</strong> persisted on the committed record: this repo&rsquo;s "
+           "<code>store/commit-record!</code> stores the whole record, so the "
+           "<code>:payload</code> the <code>:request-approval</code> node built &mdash; including "
+           "<code>:approved-by</code> &mdash; survives into <code>coordination-log</code>. It does "
+           "<em>not</em> appear as a ledger fact, because the <code>:commit</code> node appends "
+           "only its <code>:committed</code> fact; the <code>:approval-granted</code> fact stays "
+           "on the run&rsquo;s own audit channel. So the &ldquo;approved by&rdquo; column above is "
+           "<strong>audit-and-record</strong>, not ledger-derived. Rows with no approver were "
+           "auto-committed &mdash; nobody approved them, and that is a different fact from an "
+           "approver the store lost.")
+
+      :else
+      (str "<strong>The approver is not on the record.</strong> The "
+           "<code>:request-approval</code> node attaches it at <code>[:payload :approved-by]</code>, "
+           "but this repo&rsquo;s <code>store/commit-record!</code> does not retain it. The approver "
+           "shown above is therefore <strong>audit only &mdash; not retained in the store "
+           "record</strong>. This page states the gap plainly rather than printing an approver "
+           "the store does not actually hold: silence would make &ldquo;nobody approved&rdquo; and "
+           "&ldquo;the store dropped it&rdquo; look identical."))
+    "</p>\n")))
+
+;; ----------------------------- document -----------------------------
+
+(defn render
+  "Renders the full operator-console document from a completed
+  `run-demo!` result."
+  [{:keys [db runs]}]
+  (let [ops (vec (sort governor/allowed-ops))
+        phases (vec (sort (keys phase/phases)))
+        rules (hard-rules db)
+        hard-count (count (filterv #(seq (:violations %)) (ledger-holds db)))]
+    (str
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+     "<title>cloud-itonami-isic-8211 &middot; combined office administrative service activities</title>"
+     "<style>" (jp-go-dds.skin/dds+skin) "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Combined office administrative service activities (ISIC 8211) &mdash; Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample &middot; governor-gated &middot; build-time generated from a real actor run</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     (section
+      "Client service contracts"
+      (str "Ground truth from <code>officeadminops.store/all-client-records</code>. The governor "
+           "re-derives every client&rsquo;s standing from these fields, never from a proposal&rsquo;s "
+           "own claim &mdash; a client that is not <em>both</em> registered and verified HARD-holds "
+           "every proposal targeting it, at every phase.")
+      (table ["Client" "Name" "Registered" "Verified" "Governor standing"] (client-rows db)))
+
+     (section
+      "Supply vendors"
+      (str "Ground truth from <code>officeadminops.store/all-vendor-records</code>. The same "
+           "&ldquo;ground truth, not self-report&rdquo; discipline applies to the office-supplies / "
+           "equipment counterparty named by a <code>:coordinate-supply-order</code> proposal.")
+      (table ["Vendor" "Name" "Registered" "Verified" "Governor standing"] (vendor-rows db)))
+
+     (section
+      "Rollout phase gate"
+      (str "Every cell is produced by <em>calling</em> <code>officeadminops.phase/gate</code> with a "
+           "governor-clean (<code>:commit</code>) base disposition &mdash; this matrix is computed at "
+           "build time, not transcribed. Note that <code>:flag-confidentiality-concern</code> never "
+           "reaches auto-commit at any phase, including phase 3.")
+      (table (into ["Op"] (for [p phases] (str "phase " p " &middot; " (:label (get phase/phases p)))))
+             (phase-rows ops phases)))
+
+     (section
+      "HARD governor checks that actually fired"
+      (str "Grouped out of the real <code>:governor-hold</code> facts this run wrote to the ledger &mdash; "
+           "a row exists here only because the ledger carries that rule. HARD holds are permanent and "
+           "un-overridable: no human approval can clear them, and none of them ever reached a human "
+           "(verified structurally at build time). "
+           (esc hard-count) " HARD hold" (when (not= 1 hard-count) "s")
+           " over " (count rules) " distinct rule" (when (not= 1 (count rules)) "s") ".")
+      (table ["Rule" "Times fired" "Detail written to the ledger"] (hard-check-rows db)))
+
+     (section
+      "Coordination requests in this run"
+      (str "One row per real <code>langgraph.graph/run*</code> invocation. Each outcome is classified "
+           "from that run&rsquo;s <em>own</em> audit trail, never from a label. Confidence is the value "
+           "the advisor actually reported on its <code>:advisor-proposal</code> fact.")
+      (table ["Scenario" "Op" "Client" "Phase" "Outcome" "Gate reason" "Advisor confidence"]
+             (request-rows runs)))
+
+     (section
+      "Committed coordination log (SSoT)"
+      (str "The records that actually reached <code>officeadminops.store/coordination-log</code> &mdash; "
+           "the only writes this run performed. Held and rejected proposals are absent by construction: "
+           "the <code>:hold</code> node writes to the ledger and never mutates the SSoT.")
+      (table ["Op" "Client" "Committed value" "Approved by"] (coordination-rows db)))
+
+     (section
+      "Audit ledger (append-only)"
+      (str "Every decision fact this run appended to <code>officeadminops.store/ledger</code>, in order. "
+           "Rows with a basis are governor holds; rows without one are either commits or the phase gate "
+           "declining a write the rollout stage has not enabled yet.")
+      (table ["Fact" "Op" "Client" "Basis" "Confidence" "Summary"] (ledger-rows db)))
+
+     (attribution-section (approver-attribution db runs))
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>Generated by <code>officeadminops.render-html</code> (<code>clojure -M:dev:render-html</code>) "
+     "from a real <code>officeadminops.operation</code> actor run against the seeded "
+     "<code>officeadminops.store</code> demo directory. No value on this page is hand-written; the build "
+     "throws if the scenario produces no HARD governor hold. Deterministic &mdash; no timestamps, "
+     "byte-identical across reruns.</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        {:keys [holds rules]} (assert-real-holds! result)
+        html (render result)]
+    (spit out html)
+    (println "wrote" out
+             (str "(" (count (store/ledger (:db result))) " ledger facts, "
+                  holds " HARD holds over " (count rules) " distinct rules, "
+                  (count (store/coordination-log (:db result))) " committed records, "
+                  (count (:runs result)) " actor runs, "
+                  (count html) " bytes)"))
+    (println "HARD-RULES\t" (str/join " " (map str rules)))))
