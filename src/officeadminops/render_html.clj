@@ -66,7 +66,7 @@
   Usage: `clojure -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [officeadminops.advisor :as advisor]
             [officeadminops.store :as store]
             [officeadminops.phase :as phase]
@@ -282,7 +282,7 @@
   [db runs]
   (let [records (store/coordination-log db)
         approver-key? #(contains? #{"approved-by" "approved_by" "approver" "approved-by-id"}
-                                  (str/lower-case %))
+                                  (str/lower %))
         with-approver (filterv #(some approver-key? (deep-key-names %)) records)
         approved-runs (filterv #(= :approved (:kind (outcome %))) runs)]
     {:approvers (vec (sort (into #{} (keep #(:by (fact-of (:audit (:state %)) :approval-granted)))
