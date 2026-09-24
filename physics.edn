@@ -1,0 +1,34 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": robots may do document scanning/sorting, mail
+;; handling and filing for an outsourced back-office provider (ISIC 8211),
+;; with this actor as the coordination layer. The physical work declared
+;; here: shelving archive record boxes in the records room, and the mail cart
+;; delivering sorted trays through the office, including the 1:12 access
+;; ramp between the mailroom and the office floor.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-8211"
+ :cases
+ [{:id :archive-box-to-upper-shelf
+   :kind :manipulator
+   :procedure "arm lifts an archive record box from the records-room trolley onto the upper shelf of the rolling archive"
+   :params {:l1-m 0.70 :l2-m 0.60 :m1-kg 8.0 :m2-kg 5.0
+            :from [0.70 -0.20] :to [0.50 0.90] :duration-s 3.0 :steps 600}
+   :sweep {:param :payload-kg :values [4.0 7.0 10.0 13.0 16.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 200.0 :basis "estimate: continuous shoulder torque of a 20 kg payload class industrial arm"}
+   :boundary {:lo 1.0 :hi 40.0}}
+  {:id :mail-cart-up-access-ramp
+   :kind :transport
+   :procedure "mail cart robot carries sorted mail trays from the mailroom up the 1:12 access ramp and across the office floor"
+   :params {:mass-kg 40.0 :distance-m 30.0 :v-max-mps 1.0 :a-max-mps2 0.5
+            :brake-decel-mps2 0.8 :drive-force-n 90.0 :crr 0.015 :slope-deg 4.76
+            :cog-height-m 0.45 :support-half-length-m 0.28 :max-time-s 1800.0}
+   :sweep {:param :payload-kg :values [5.0 15.0 30.0 50.0 80.0]}
+   :quantity :cycle-time-s
+   :limit {:max 45.0 :basis "estimate: one delivery leg inside the provider's internal mail-round timetable; ramp slope 1:12 (4.76 degrees) as the steepest accessible ramp"}
+   :boundary {:lo 1.0 :hi 100.0}}]}
